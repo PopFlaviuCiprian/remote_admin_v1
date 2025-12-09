@@ -1,0 +1,8 @@
+pyinstaller
+websockets
+PyQt5
+mss
+opencv-python
+numpy
+Pillow
+pynput
