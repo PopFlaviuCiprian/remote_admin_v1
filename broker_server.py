@@ -1,49 +1,71 @@
 # broker_server.py
-import asyncio
+import asyncio, json, secrets
 import websockets
 
-clients = {}  # client_id -> websocket
+PORT = 9000
+clients = {}   # id -> {"ws": websocket, "passwd": "...", "info": {...}}
 
-async def handler(websocket):
-    while True:
-        try:
-            message = await websocket.recv()
-        except:
-            # dacă se deconectează un client, îl ștergem
-            for cid, ws in list(clients.items()):
-                if ws == websocket:
-                    del clients[cid]
-            break
+async def handler(ws, path):
+    my_id = None
+    try:
+        async for raw in ws:
+            # text messages only for broker control (clients send JSON lines)
+            try:
+                msg = json.loads(raw)
+            except Exception:
+                continue
 
-        parts = message.split("|", 2)
-        cmd = parts[0]
-
-        # --------------- CLIENTUL SE ÎNREGISTREAZĂ ----------------
-        if cmd == "REGISTER":
-            client_id = parts[1]
-            clients[client_id] = websocket
-            print(f"[REGISTER] {client_id} conectat.")
-
-        # --------------- VIEWER CERE CONECTAREA ----------------
-        elif cmd == "CONNECT":
-            viewer_id = parts[1]
-            target_id = parts[2]
-
-            if target_id in clients:
-                await clients[target_id].send(f"REQUEST|{viewer_id}|")
-
-        # --------------- MESAJ BIDIRECȚIONAL ----------------
-        elif cmd == "FORWARD":
-            sender_id = parts[1]
-            rest = parts[2]
-            target_id, data = rest.split(":", 1)
-
-            if target_id in clients:
-                await clients[target_id].send(f"DATA|{sender_id}|{data}")
+            typ = msg.get("type")
+            if typ == "register":
+                my_id = msg["id"]
+                clients[my_id] = {"ws": ws, "passwd": msg.get("password"), "info": msg.get("info", {})}
+                print(f"[BROKER] REGISTER {my_id}")
+                await ws.send(json.dumps({"type":"registered","id":my_id}))
+            elif typ == "connect":
+                # viewer requests connection to target host
+                viewer = msg["from"]
+                target = msg["target"]
+                passwd = msg.get("password", "")
+                if target in clients:
+                    print(f"[BROKER] {viewer} requests connect -> {target}")
+                    await clients[target]["ws"].send(json.dumps({"type":"incoming","from":viewer}))
+                else:
+                    await ws.send(json.dumps({"type":"error","error":"target_not_online"}))
+            elif typ == "accept":
+                # host accepts connection request from viewer
+                host = msg["from"]
+                viewer = msg["viewer"]
+                # create session key (Fernet) - demo: symmetric key distributed by broker
+                from cryptography.fernet import Fernet
+                session_key = Fernet.generate_key().decode()
+                print(f"[BROKER] Session key for {host}<->{viewer} created.")
+                # send session key to host and viewer
+                if viewer in clients and host in clients:
+                    await clients[viewer]["ws"].send(json.dumps({"type":"session","key":session_key,"peer":host}))
+                    await clients[host]["ws"].send(json.dumps({"type":"session","key":session_key,"peer":viewer}))
+                else:
+                    if host in clients:
+                        await clients[host]["ws"].send(json.dumps({"type":"error","error":"viewer_not_online"}))
+            elif typ == "forward":
+                # generic forward text: {type: "forward", from:, to:, payload: {...}}
+                to = msg.get("to")
+                if to in clients:
+                    await clients[to]["ws"].send(json.dumps(msg.get("payload")))
+            elif typ == "list":
+                # debug: return list of online ids
+                ids = list(clients.keys())
+                await ws.send(json.dumps({"type":"list","ids":ids}))
+    except websockets.ConnectionClosed:
+        pass
+    finally:
+        if my_id and my_id in clients and clients[my_id]["ws"] == ws:
+            del clients[my_id]
+            print(f"[BROKER] UNREGISTER {my_id}")
 
 async def main():
-    print("Broker server pornit pe portul 9000...")
-    async with websockets.serve(handler, "0.0.0.0", 9000):
-        await asyncio.Future()  # rulează la infinit
+    print(f"[BROKER] running on :{PORT}")
+    async with websockets.serve(handler,"0.0.0.0",PORT, max_size=None):
+        await asyncio.Future()
 
-asyncio.run(main())
+if __name__ == "__main__":
+    asyncio.run(main())
